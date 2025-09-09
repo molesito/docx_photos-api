@@ -7,7 +7,7 @@ from docx.shared import RGBColor, Inches
 from werkzeug.datastructures import FileStorage
 
 # Intentamos usar Pillow para conservar la relación de aspecto al escalar.
-# Si no está disponible, trabajaremos con un "best effort" por ancho.
+# Si no está disponible, hacemos un ajuste seguro por ancho.
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -20,16 +20,16 @@ app = Flask(__name__)
 def health():
     return jsonify({"ok": True})
 
-# ------------ Utilidades Markdown -> DOCX (ahora con imágenes) ----------------
+# ------------ Utilidades Markdown -> DOCX (con imágenes, sin captions/placemarks) ----------------
 
 HEADING_RE      = re.compile(r'^(#{1,6})\s+(.*)$')
 UL_RE           = re.compile(r'^\s*[-*+]\s+(.*)$')
 OL_RE           = re.compile(r'^\s*\d+\.\s+(.*)$')
 TABLE_ROW_RE    = re.compile(r'^\s*\|(.+)\|\s*$')
 TABLE_ALIGN_RE  = re.compile(r'^\s*\|?\s*(:?-{3,}:?\s*\|)+\s*(:?-{3,}:?)\s*\|?\s*$')
-# Imagen en línea tipo: ![alt](fileName.ext)
+# Imagen en bloque tipo: ![alt](fileName.ext)
 IMG_LINE_RE     = re.compile(r'^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$')
-# Imagen embebida en medio de texto (menos habitual en Mistral OCR, pero soportado)
+# Imagen embebida en medio de texto (por si aparece): ![alt](fileName.ext)
 IMG_INLINE_RE   = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
 def force_styles_black(doc: Document):
@@ -81,19 +81,14 @@ def flush_table(doc, rows):
         for j in range(cols):
             table.cell(i, j).text = row[j] if j < len(row) else ""
 
-def add_image_paragraph(doc: Document, filename: str, img_bytes: bytes, alt_text: str = ""):
+def add_image_paragraph(doc: Document, img_bytes: bytes):
     """
     Inserta una imagen ajustando su ancho al ancho útil de la página.
-    Mantiene proporción si PIL está disponible.
+    Mantiene proporción si PIL está disponible. No añade captions ni texto.
     """
-    # Calcular ancho útil de la página (en EMUs) -> convertimos luego a Inches
+    # Calcular ancho útil (en EMUs) -> convertimos a pulgadas
     section = doc.sections[-1]
-    page_width = section.page_width
-    left_margin = section.left_margin
-    right_margin = section.right_margin
-    usable_width_emu = page_width - left_margin - right_margin
-
-    # EMU por pulgada en python-docx
+    usable_width_emu = section.page_width - section.left_margin - section.right_margin
     EMUS_PER_INCH = 914400
     usable_width_in = float(usable_width_emu) / EMUS_PER_INCH
 
@@ -103,62 +98,48 @@ def add_image_paragraph(doc: Document, filename: str, img_bytes: bytes, alt_text
         try:
             with Image.open(io.BytesIO(img_bytes)) as im:
                 width_px, height_px = im.size
-                dpi = im.info.get("dpi", (96, 96))[0] or 96
-                width_in = width_px / float(dpi)
-                height_in = height_px / float(dpi)
+                dpi_x = im.info.get("dpi", (96, 96))[0] or 96
+                width_in = width_px / float(dpi_x)
 
-                # Escalado: si la imagen es más ancha que el ancho útil, reducimos
+                # Escalado por ancho útil
                 scale = 1.0
                 if width_in > usable_width_in:
                     scale = usable_width_in / width_in
 
                 new_width_in = width_in * scale
-                # Insertamos con ancho en inches; docx mantiene la relación
                 p = doc.add_paragraph()
                 run = p.add_run()
                 run.add_picture(stream, width=Inches(new_width_in))
-                if alt_text:
-                    # python-docx no soporta alt_text nativo; añadimos como pie/nota ligera
-                    p2 = doc.add_paragraph(alt_text)
-                    p2.style = "Caption" if "Caption" in [s.name for s in doc.styles] else "Normal"
                 return
         except Exception:
-            # Si hay cualquier problema con PIL, fallback
-            pass
+            pass  # Fallback si PIL falla
 
-    # Fallback sin PIL: insertar a ancho útil (podría distorsionar en casos raros)
+    # Fallback sin PIL: insertar a ancho útil
     p = doc.add_paragraph()
     run = p.add_run()
     stream.seek(0)
     run.add_picture(stream, width=Inches(usable_width_in))
-    if alt_text:
-        p2 = doc.add_paragraph(alt_text)
-        p2.style = "Caption" if "Caption" in [s.name for s in doc.styles] else "Normal"
 
 def handle_inline_images(doc: Document, text: str, images: dict):
     """
-    Parte una línea con texto + imágenes inline en runs y añade imágenes donde tocan.
-    Si falta la imagen, deja un marcador [imagen faltante: filename].
+    Divide una línea con texto + imágenes inline, añade texto e imágenes donde tocan.
+    Si una imagen falta, simplemente se omite (no se escribe nada).
     """
     parts = []
     last_end = 0
     for m in IMG_INLINE_RE.finditer(text):
         if m.start() > last_end:
             parts.append(("text", text[last_end:m.start()]))
-        alt = (m.group(1) or "").strip()
         fname = (m.group(2) or "").strip()
-        parts.append(("img", (fname, alt)))
+        parts.append(("img", fname))
         last_end = m.end()
     if last_end < len(text):
         parts.append(("text", text[last_end:]))
 
     if not parts:
-        # no había imagen inline; devolver como párrafo normal
         add_paragraph(doc, text)
         return
 
-    # Construimos: texto previo como párrafo, imagen como bloque independiente para
-    # asegurar buen flujo en Word, y continuamos.
     for kind, payload in parts:
         if kind == "text":
             if payload.strip():
@@ -166,12 +147,11 @@ def handle_inline_images(doc: Document, text: str, images: dict):
             else:
                 doc.add_paragraph("")
         else:
-            fname, alt = payload
+            fname = payload
             blob = images.get(fname)
             if blob:
-                add_image_paragraph(doc, fname, blob, alt_text=alt)
-            else:
-                add_paragraph(doc, f"[imagen faltante: {fname}]")
+                add_image_paragraph(doc, blob)
+            # si no está, la omitimos silenciosamente
 
 def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
     """
@@ -188,7 +168,6 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
 
     def flush_para():
         if para_buf:
-            # Antes de cerrar párrafo, procesar imágenes inline si existieran:
             text = " ".join(para_buf).strip()
             para_buf.clear()
             if IMG_INLINE_RE.search(text):
@@ -245,13 +224,11 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
             flush_para()
             flush_list(doc, ul_buf, ordered=False)
             flush_list(doc, ol_buf, ordered=True)
-            alt = (m_img.group(1) or "").strip()
             fname = (m_img.group(2) or "").strip()
             blob = images.get(fname)
             if blob:
-                add_image_paragraph(doc, fname, blob, alt_text=alt)
-            else:
-                add_paragraph(doc, f"[imagen faltante: {fname}]")
+                add_image_paragraph(doc, blob)
+            # si no está, la omitimos silenciosamente
             continue
 
         # Separador de párrafos
@@ -261,7 +238,7 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
             flush_list(doc, ol_buf, ordered=True)
             continue
 
-        # Texto normal (acumulado)
+        # Texto normal
         para_buf.append(line.strip())
 
     # flush final
@@ -288,15 +265,15 @@ def make_docx():
       2) multipart/form-data:
            - campo de texto: "markdown"
            - n veces: archivo "file" (el nombre del archivo DEBE coincidir con el del Markdown)
+    Devuelve únicamente el archivo DOCX generado.
     """
-    # Intento 1: JSON (como el código original)
+    # Opción 1: JSON (compat con tu endpoint anterior)
     data = request.get_json(silent=True)
     if data and isinstance(data, dict) and ("markdown" in data or "text" in data):
         filename = data.get("filename", "output.docx")
         if data.get("markdown"):
             buf, fname = markdown_to_doc(data["markdown"], images={}, filename=filename)
         else:
-            # compat: texto plano en un párrafo
             doc = Document()
             force_styles_black(doc)
             add_paragraph(doc, data.get("text", ""))
@@ -312,28 +289,20 @@ def make_docx():
             mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
 
-    # Intento 2: multipart/form-data (n8n)
-    # - markdown en request.form["markdown"]
-    # - imágenes en request.files.getlist("file")
+    # Opción 2: multipart/form-data (n8n): markdown + múltiples "file"
     if request.form and ("markdown" in request.form or "text" in request.form):
         md_text = request.form.get("markdown", None)
         plain_text = request.form.get("text", None)
         filename = request.form.get("filename", "output.docx")
 
-        # Recoger todas las imágenes bajo la misma key "file"
         images_map = {}
-        file_list = request.files.getlist("file")
-        for f in file_list:
-            if not isinstance(f, FileStorage):
-                continue
-            # Guardamos por filename exacto (que debe coincidir con el que aparece en el Markdown)
-            if f.filename:
+        for f in request.files.getlist("file"):
+            if isinstance(f, FileStorage) and f.filename:
                 images_map[f.filename] = f.read()
 
         if md_text:
             buf, fname = markdown_to_doc(md_text, images_map, filename=filename)
         else:
-            # compat: texto plano si solo viene 'text' sin markdown
             doc = Document()
             force_styles_black(doc)
             add_paragraph(doc, plain_text or "")
@@ -349,7 +318,6 @@ def make_docx():
             mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
 
-    # Si no es ni JSON ni multipart esperado:
     return jsonify({"error": "Bad request: envía JSON con 'markdown' o multipart/form-data con 'markdown' y archivos 'file'."}), 400
 
 
