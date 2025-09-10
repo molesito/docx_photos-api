@@ -6,8 +6,6 @@ from docx import Document
 from docx.shared import RGBColor, Inches
 from werkzeug.datastructures import FileStorage
 
-# Intentamos usar Pillow para conservar la relación de aspecto al escalar.
-# Si no está disponible, hacemos un ajuste seguro por ancho.
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -20,20 +18,16 @@ app = Flask(__name__)
 def health():
     return jsonify({"ok": True})
 
-# ------------ Utilidades Markdown -> DOCX (con imágenes, sin captions/placemarks) ----------------
+# ------------ Utilidades Markdown -> DOCX ----------------
 
 HEADING_RE      = re.compile(r'^(#{1,6})\s+(.*)$')
 UL_RE           = re.compile(r'^\s*[-*+]\s+(.*)$')
 OL_RE           = re.compile(r'^\s*\d+\.\s+(.*)$')
 TABLE_ROW_RE    = re.compile(r'^\s*\|(.+)\|\s*$')
-TABLE_ALIGN_RE  = re.compile(r'^\s*\|?\s*(:?-{3,}:?\s*\|)+\s*(:?-{3,}:?)\s*\|?\s*$')
-# Imagen en bloque tipo: ![alt](fileName.ext)
 IMG_LINE_RE     = re.compile(r'^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$')
-# Imagen embebida en medio de texto (por si aparece): ![alt](fileName.ext)
 IMG_INLINE_RE   = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
 def force_styles_black(doc: Document):
-    """Pone el color de fuente a negro en estilos usados (encabezados, normal, listas)."""
     target_styles = ["Normal", "List Paragraph", "List Bullet", "List Number"]
     target_styles += [f"Heading {i}" for i in range(1, 10)]
     for name in target_styles:
@@ -46,7 +40,7 @@ def force_styles_black(doc: Document):
 
 def add_paragraph(doc, text):
     if not text.strip():
-        doc.add_paragraph("")  # línea en blanco
+        doc.add_paragraph("")
     else:
         doc.add_paragraph(text)
 
@@ -58,11 +52,17 @@ def flush_list(doc, buf, ordered):
         doc.add_paragraph(item, style=style)
     buf.clear()
 
+def is_align_row(row: str) -> bool:
+    """Devuelve True si la fila es solo alineación tipo --- o :---:."""
+    row = row.strip().strip("|").strip()
+    cells = [c.strip() for c in row.split("|")]
+    return all(re.fullmatch(r':?-{3,}:?', c) for c in cells)
+
 def flush_table(doc, rows):
     if not rows:
         return
-    # Ignora fila de alineación tipo | :-- | --- | :--: |
-    filtered = [r for r in rows if not TABLE_ALIGN_RE.match(r)]
+    # Filtra filas de alineación (| --- | --- | ... |)
+    filtered = [r for r in rows if not is_align_row(r)]
     if not filtered:
         return
     matrix = []
@@ -82,11 +82,6 @@ def flush_table(doc, rows):
             table.cell(i, j).text = row[j] if j < len(row) else ""
 
 def add_image_paragraph(doc: Document, img_bytes: bytes):
-    """
-    Inserta una imagen ajustando su ancho al ancho útil de la página.
-    Mantiene proporción si PIL está disponible. No añade captions ni texto.
-    """
-    # Calcular ancho útil (en EMUs) -> convertimos a pulgadas
     section = doc.sections[-1]
     usable_width_emu = section.page_width - section.left_margin - section.right_margin
     EMUS_PER_INCH = 914400
@@ -100,31 +95,23 @@ def add_image_paragraph(doc: Document, img_bytes: bytes):
                 width_px, height_px = im.size
                 dpi_x = im.info.get("dpi", (96, 96))[0] or 96
                 width_in = width_px / float(dpi_x)
-
-                # Escalado por ancho útil
                 scale = 1.0
                 if width_in > usable_width_in:
                     scale = usable_width_in / width_in
-
                 new_width_in = width_in * scale
                 p = doc.add_paragraph()
                 run = p.add_run()
                 run.add_picture(stream, width=Inches(new_width_in))
                 return
         except Exception:
-            pass  # Fallback si PIL falla
+            pass
 
-    # Fallback sin PIL: insertar a ancho útil
     p = doc.add_paragraph()
     run = p.add_run()
     stream.seek(0)
     run.add_picture(stream, width=Inches(usable_width_in))
 
 def handle_inline_images(doc: Document, text: str, images: dict):
-    """
-    Divide una línea con texto + imágenes inline, añade texto e imágenes donde tocan.
-    Si una imagen falta, simplemente se omite (no se escribe nada).
-    """
     parts = []
     last_end = 0
     for m in IMG_INLINE_RE.finditer(text):
@@ -151,13 +138,8 @@ def handle_inline_images(doc: Document, text: str, images: dict):
             blob = images.get(fname)
             if blob:
                 add_image_paragraph(doc, blob)
-            # si no está, la omitimos silenciosamente
 
 def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
-    """
-    Convierte Markdown a DOCX, insertando imágenes encontradas en `images`.
-    `images` es un dict: {fileName(str): bytes}
-    """
     doc = Document()
     force_styles_black(doc)
 
@@ -218,7 +200,7 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
             ol_buf.append(m_ol.group(1).strip())
             continue
 
-        # Línea de imagen (bloque)
+        # Imagen en línea (bloque)
         m_img = IMG_LINE_RE.match(line)
         if m_img:
             flush_para()
@@ -228,7 +210,6 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
             blob = images.get(fname)
             if blob:
                 add_image_paragraph(doc, blob)
-            # si no está, la omitimos silenciosamente
             continue
 
         # Separador de párrafos
@@ -241,7 +222,6 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
         # Texto normal
         para_buf.append(line.strip())
 
-    # flush final
     flush_para()
     flush_list(doc, ul_buf, ordered=False)
     flush_list(doc, ol_buf, ordered=True)
@@ -259,15 +239,6 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
 
 @app.post("/docx")
 def make_docx():
-    """
-    Acepta:
-      1) JSON: {"markdown": "...", "filename": "informe.docx"} (compatibilidad)
-      2) multipart/form-data:
-           - campo de texto: "markdown"
-           - n veces: archivo "file" (el nombre del archivo DEBE coincidir con el del Markdown)
-    Devuelve únicamente el archivo DOCX generado.
-    """
-    # Opción 1: JSON (compat con tu endpoint anterior)
     data = request.get_json(silent=True)
     if data and isinstance(data, dict) and ("markdown" in data or "text" in data):
         filename = data.get("filename", "output.docx")
@@ -281,25 +252,17 @@ def make_docx():
             doc.save(buf)
             buf.seek(0)
             fname = filename
+        return send_file(buf, as_attachment=True, download_name=fname,
+                         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-        return send_file(
-            buf,
-            as_attachment=True,
-            download_name=fname,
-            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-
-    # Opción 2: multipart/form-data (n8n): markdown + múltiples "file"
     if request.form and ("markdown" in request.form or "text" in request.form):
         md_text = request.form.get("markdown", None)
         plain_text = request.form.get("text", None)
         filename = request.form.get("filename", "output.docx")
-
         images_map = {}
         for f in request.files.getlist("file"):
             if isinstance(f, FileStorage) and f.filename:
                 images_map[f.filename] = f.read()
-
         if md_text:
             buf, fname = markdown_to_doc(md_text, images_map, filename=filename)
         else:
@@ -310,18 +273,11 @@ def make_docx():
             doc.save(buf)
             buf.seek(0)
             fname = filename
-
-        return send_file(
-            buf,
-            as_attachment=True,
-            download_name=fname,
-            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
+        return send_file(buf, as_attachment=True, download_name=fname,
+                         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     return jsonify({"error": "Bad request: envía JSON con 'markdown' o multipart/form-data con 'markdown' y archivos 'file'."}), 400
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
