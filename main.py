@@ -1,16 +1,13 @@
 import os
 import io
 import re
+import base64
+import json
 from flask import Flask, request, send_file, jsonify
 from docx import Document
 from docx.shared import RGBColor, Inches
 from werkzeug.datastructures import FileStorage
-
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except Exception:
-    PIL_AVAILABLE = False
+from PIL import Image, UnidentifiedImageError
 
 app = Flask(__name__)
 
@@ -53,7 +50,6 @@ def flush_list(doc, buf, ordered):
     buf.clear()
 
 def is_align_row(row: str) -> bool:
-    """Devuelve True si la fila es solo alineación tipo --- o :---:."""
     row = row.strip().strip("|").strip()
     cells = [c.strip() for c in row.split("|")]
     return all(re.fullmatch(r':?-{3,}:?', c) for c in cells)
@@ -61,7 +57,6 @@ def is_align_row(row: str) -> bool:
 def flush_table(doc, rows):
     if not rows:
         return
-    # Filtra filas de alineación (| --- | --- | ... |)
     filtered = [r for r in rows if not is_align_row(r)]
     if not filtered:
         return
@@ -89,22 +84,21 @@ def add_image_paragraph(doc: Document, img_bytes: bytes):
 
     stream = io.BytesIO(img_bytes)
 
-    if PIL_AVAILABLE:
-        try:
-            with Image.open(io.BytesIO(img_bytes)) as im:
-                width_px, height_px = im.size
-                dpi_x = im.info.get("dpi", (96, 96))[0] or 96
-                width_in = width_px / float(dpi_x)
-                scale = 1.0
-                if width_in > usable_width_in:
-                    scale = usable_width_in / width_in
-                new_width_in = width_in * scale
-                p = doc.add_paragraph()
-                run = p.add_run()
-                run.add_picture(stream, width=Inches(new_width_in))
-                return
-        except Exception:
-            pass
+    try:
+        with Image.open(io.BytesIO(img_bytes)) as im:
+            width_px, height_px = im.size
+            dpi_x = im.info.get("dpi", (96, 96))[0] or 96
+            width_in = width_px / float(dpi_x)
+            scale = 1.0
+            if width_in > usable_width_in:
+                scale = usable_width_in / width_in
+            new_width_in = width_in * scale
+            p = doc.add_paragraph()
+            run = p.add_run()
+            run.add_picture(stream, width=Inches(new_width_in))
+            return
+    except Exception:
+        pass
 
     p = doc.add_paragraph()
     run = p.add_run()
@@ -160,7 +154,6 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
     for raw in lines:
         line = raw.rstrip("\n")
 
-        # Tablas
         if TABLE_ROW_RE.match(line):
             in_table = True
             tbl_buf.append(line)
@@ -174,7 +167,6 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
                 tbl_buf = []
                 in_table = False
 
-        # Encabezados
         m = HEADING_RE.match(line)
         if m:
             flush_para()
@@ -186,7 +178,6 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
             doc.add_heading(text, level=level)
             continue
 
-        # Listas
         m_ul = UL_RE.match(line)
         m_ol = OL_RE.match(line)
         if m_ul:
@@ -200,7 +191,6 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
             ol_buf.append(m_ol.group(1).strip())
             continue
 
-        # Imagen en línea (bloque)
         m_img = IMG_LINE_RE.match(line)
         if m_img:
             flush_para()
@@ -212,14 +202,12 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
                 add_image_paragraph(doc, blob)
             continue
 
-        # Separador de párrafos
         if not line.strip():
             flush_para()
             flush_list(doc, ul_buf, ordered=False)
             flush_list(doc, ol_buf, ordered=True)
             continue
 
-        # Texto normal
         para_buf.append(line.strip())
 
     flush_para()
@@ -241,9 +229,23 @@ def markdown_to_doc(md_text: str, images: dict, filename: str = "output.docx"):
 def make_docx():
     data = request.get_json(silent=True)
     if data and isinstance(data, dict) and ("markdown" in data or "text" in data):
-        filename = data.get("filename", "output.docx")
+        base_name = data.get("output_name") or data.get("filename") or "output"
+        if not base_name.lower().endswith(".docx"):
+            base_name += ".docx"
+
+        images_map = {}
+        if "images" in data and isinstance(data["images"], list):
+            for img_obj in data["images"]:
+                img_id = img_obj.get("id")
+                img_b64 = img_obj.get("image_base64")
+                if img_id and img_b64:
+                    try:
+                        images_map[img_id] = base64.b64decode(img_b64)
+                    except Exception:
+                        pass
+
         if data.get("markdown"):
-            buf, fname = markdown_to_doc(data["markdown"], images={}, filename=filename)
+            buf, fname = markdown_to_doc(data["markdown"], images=images_map, filename=base_name)
         else:
             doc = Document()
             force_styles_black(doc)
@@ -251,20 +253,37 @@ def make_docx():
             buf = io.BytesIO()
             doc.save(buf)
             buf.seek(0)
-            fname = filename
+            fname = base_name
+
         return send_file(buf, as_attachment=True, download_name=fname,
                          mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     if request.form and ("markdown" in request.form or "text" in request.form):
         md_text = request.form.get("markdown", None)
         plain_text = request.form.get("text", None)
-        filename = request.form.get("filename", "output.docx")
+        base_name = request.form.get("output_name") or request.form.get("filename") or "output"
+        if not base_name.lower().endswith(".docx"):
+            base_name += ".docx"
+
         images_map = {}
+        if "images" in request.form:
+            try:
+                images_json = json.loads(request.form["images"])
+                if isinstance(images_json, list):
+                    for img_obj in images_json:
+                        img_id = img_obj.get("id")
+                        img_b64 = img_obj.get("image_base64")
+                        if img_id and img_b64:
+                            images_map[img_id] = base64.b64decode(img_b64)
+            except Exception:
+                pass
+
         for f in request.files.getlist("file"):
             if isinstance(f, FileStorage) and f.filename:
                 images_map[f.filename] = f.read()
+
         if md_text:
-            buf, fname = markdown_to_doc(md_text, images_map, filename=filename)
+            buf, fname = markdown_to_doc(md_text, images_map, filename=base_name)
         else:
             doc = Document()
             force_styles_black(doc)
@@ -272,11 +291,122 @@ def make_docx():
             buf = io.BytesIO()
             doc.save(buf)
             buf.seek(0)
-            fname = filename
+            fname = base_name
+
         return send_file(buf, as_attachment=True, download_name=fname,
                          mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-    return jsonify({"error": "Bad request: envía JSON con 'markdown' o multipart/form-data con 'markdown' y archivos 'file'."}), 400
+    return jsonify({"error": "Bad request"}), 400
+
+# -------------------- Endpoint /merge --------------------
+
+@app.post("/merge")
+def merge_docx():
+    """
+    Soporta JSON o form-data.
+    Concatena documentos con salto de página entre cada uno.
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        data = request.form.to_dict()
+
+    if not data or "docs" not in data:
+        return jsonify({"error": "Bad request: falta 'docs'"}), 400
+
+    docs_field = data["docs"]
+
+    if isinstance(docs_field, str):
+        try:
+            docs_dict = json.loads(docs_field)
+        except Exception:
+            return jsonify({"error": "El campo 'docs' no es un JSON válido"}), 400
+    elif isinstance(docs_field, dict):
+        docs_dict = docs_field
+    else:
+        return jsonify({"error": "Formato de 'docs' no válido"}), 400
+
+    merged = None
+    for key in sorted(docs_dict.keys(), key=lambda x: int(x)):
+        b64 = docs_dict[key]
+        try:
+            content = base64.b64decode(b64)
+            subdoc = Document(io.BytesIO(content))
+        except Exception as e:
+            return jsonify({"error": f"Error procesando doc {key}: {e}"}), 400
+
+        if merged is None:
+            merged = Document(io.BytesIO(content))
+        else:
+            merged.add_page_break()
+            for element in subdoc.element.body:
+                merged.element.body.append(element)
+
+    buf = io.BytesIO()
+    merged.save(buf)
+    buf.seek(0)
+
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=data.get("output_name", "merged.docx"),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
+# -------------------- Nuevo endpoint /crop --------------------
+
+@app.post("/crop")
+def crop_image():
+    """
+    Espera:
+      - file: imagen original (binario, multipart/form-data)
+      - coords: JSON como string, por ejemplo:
+        {
+          "id":"img-0.jpeg",
+          "top_left_x":289,
+          "top_left_y":667,
+          "bottom_right_x":1132,
+          "bottom_right_y":891
+        }
+    Devuelve:
+      - La imagen recortada en binario (JPEG).
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "Falta la imagen en 'file'"}), 400
+    coords_raw = request.form.get("coords")
+    if not coords_raw:
+        return jsonify({"error": "Faltan las coordenadas en 'coords'"}), 400
+
+    try:
+        coords = json.loads(coords_raw)
+    except Exception as e:
+        return jsonify({"error": f"coords inválido: {e}"}), 400
+
+    try:
+        img_file = request.files["file"]
+        img = Image.open(img_file.stream).convert("RGB")
+    except UnidentifiedImageError:
+        return jsonify({"error": "Formato de imagen no reconocido"}), 400
+
+    try:
+        x1 = int(coords["top_left_x"])
+        y1 = int(coords["top_left_y"])
+        x2 = int(coords["bottom_right_x"])
+        y2 = int(coords["bottom_right_y"])
+    except Exception:
+        return jsonify({"error": "Coordenadas incompletas o no numéricas"}), 400
+
+    crop = img.crop((x1, y1, x2, y2))
+
+    buf = io.BytesIO()
+    crop.save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+
+    return send_file(
+        buf,
+        mimetype="image/jpeg",
+        as_attachment=True,
+        download_name=coords.get("id", "crop.jpeg")
+    )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
